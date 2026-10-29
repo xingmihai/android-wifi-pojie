@@ -42,6 +42,20 @@ android {
         buildConfigField("String", "GIT_ID", "\"$gitId\"")
     }
 
+    // 签名信息全部来自环境变量（CI 侧由仓库密钥注入）。
+    // 本地构建未设置这些变量时会自动跳过，不会打断普通 debug/release 构建。
+    signingConfigs {
+        val ksPath = System.getenv("SIGNING_KEYSTORE_PATH")
+        if (!ksPath.isNullOrBlank() && file(ksPath).exists()) {
+            create("release") {
+                storeFile = file(ksPath)
+                storePassword = System.getenv("SIGNING_KEYSTORE_PASSWORD")
+                keyAlias = System.getenv("SIGNING_KEY_ALIAS")
+                keyPassword = System.getenv("SIGNING_KEY_PASSWORD")
+            }
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = true
@@ -50,6 +64,7 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
+            signingConfigs.findByName("release")?.let { signingConfig = it }
         }
         debug {
             applicationIdSuffix = ".debug"

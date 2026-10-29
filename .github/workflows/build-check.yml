@@ -1,0 +1,55 @@
+name: 编译校验
+
+on:
+  push:
+    branches-ignore:
+      - 'gh-pages'
+      - 'ci-log-*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 配置 JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: gradle
+
+      - name: 准备 Android SDK
+        run: |
+          export ANDROID_HOME=${ANDROID_HOME:-$ANDROID_SDK_ROOT}
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          mkdir -p "$ANDROID_HOME/licenses"
+          printf '\n24333f8a63b6825ea9c5514f83c2829b004d1fee\n' > "$ANDROID_HOME/licenses/android-sdk-license"
+          printf '\n8933bad161af4178b1185d1a37fbf41ea5269c55\n' > "$ANDROID_HOME/licenses/android-sdk-license"
+          SM=$(command -v sdkmanager || echo "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager")
+          echo "sdkmanager=$SM"
+          yes | "$SM" --licenses 2>&1 | tail -3 || true
+          "$SM" --install "platforms;android-36" "build-tools;36.0.0" 2>&1 | tail -5 || true
+          ls "$ANDROID_HOME/platforms" 2>&1 || true
+
+      - name: 编译 Debug 包
+        run: |
+          chmod +x ./gradlew
+          ./gradlew :app:assembleDebug --stacktrace 2>&1 | tee build-log.txt
+          exit ${PIPESTATUS[0]}
+
+      - name: 回传构建日志
+        if: always()
+        run: |
+          tail -150 build-log.txt > build-log-tail.txt 2>/dev/null || echo "(无日志)" > build-log-tail.txt
+          git config user.name "ci-bot"
+          git config user.email "ci-bot@users.noreply.github.com"
+          git checkout -B "ci-log-${GITHUB_RUN_ID}"
+          git add -f build-log-tail.txt
+          git commit -m "ci: 构建日志 run-${GITHUB_RUN_ID}" || exit 0
+          git push -f origin "ci-log-${GITHUB_RUN_ID}"

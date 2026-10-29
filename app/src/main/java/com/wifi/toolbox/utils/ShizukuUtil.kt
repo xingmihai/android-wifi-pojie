@@ -49,6 +49,27 @@ object ShizukuUtil {
 
     const val PACKAGE_NAME = "com.android.shell"
 
+    // region 反射缓存（破解热路径每次尝试都会命中，缓存后可省掉重复的 Class.forName / getMethod / getField）
+    private val wifiConfigClassLazy = lazy { Class.forName("android.net.wifi.WifiConfiguration") }
+    private val methodCache = ConcurrentHashMap<String, Method>()
+    private val fieldCache = ConcurrentHashMap<String, java.lang.reflect.Field>()
+
+    private fun wifiConfigurationClass(): Class<*> = wifiConfigClassLazy.value
+
+    private fun wifiConfigField(name: String): java.lang.reflect.Field =
+        fieldCache.getOrPut("cfg:$name") { wifiConfigurationClass().getField(name) }
+
+    private val wifiConfigCtorLazy = lazy {
+        wifiConfigurationClass().getDeclaredConstructor().apply { isAccessible = true }
+    }
+
+    /** 复用同一个无参构造器，避免每次 newInstance 前的构造器查找 */
+    private fun newWifiConfiguration(): Any = wifiConfigCtorLazy.value.newInstance()
+
+    private fun scanResultField(name: String): java.lang.reflect.Field =
+        fieldCache.getOrPut("sr:$name") { Class.forName("android.net.wifi.ScanResult").getField(name) }
+    // endregion
+
     private fun asInterface(className: String, original: IBinder): Any {
         return Class.forName("$className\$Stub").run {
             getMethod("asInterface", IBinder::class.java).invoke(
@@ -175,16 +196,34 @@ object ShizukuUtil {
      * * **Android 11**: 传入 `(int netId, IBinder binder, IActionListener listener, int callbackIdentifier)`，返回 `void` 。
      * * **Android 12 - 16**: 传入 `(int netId, IActionListener listener)`，返回 `void` 。
      */
+    /**
+     * 带缓存的查找入口。
+     *
+     * 性能说明：破解主循环里每尝试一个密码都会走到 addOrUpdateNetwork + enableNetwork，
+     * 原实现每次都要 Class.forName + getMethod（反射查找在最坏情况下是毫秒级），
+     * 这部分开销完全可以通过缓存抹掉。
+     */
     @SuppressLint("PrivateApi")
     fun getWifiMethod(wifiService: Any, methodName: String): Method {
+        val cacheKey = "${wifiService.javaClass.name}#$methodName"
+        methodCache[cacheKey]?.let { return it }
+        val resolved = resolveWifiMethod(wifiService, methodName)
+            ?: throw NoSuchMethodException(methodName)
+        runCatching { resolved.isAccessible = true }
+        methodCache[cacheKey] = resolved
+        return resolved
+    }
+
+    @SuppressLint("PrivateApi")
+    private fun resolveWifiMethod(wifiService: Any, methodName: String): Method? {
         val clazz = wifiService::class.java
         val sdk = Build.VERSION.SDK_INT
         val stringClass = String::class.java
         val intType = Integer.TYPE
         val booleanType = java.lang.Boolean.TYPE
-        val wifiConfigClass = Class.forName("android.net.wifi.WifiConfiguration")
+        val wifiConfigClass = wifiConfigurationClass()
 
-        val method = when (methodName) {
+        val method: Method? = when (methodName) {
             "setWifiEnabled" -> {
                 try {
                     clazz.getMethod(methodName, stringClass, booleanType)
@@ -300,7 +339,7 @@ object ShizukuUtil {
 
             else -> null
         }
-        return method ?: throw NoSuchMethodException(methodName)
+        return method
     }
 
     fun setWifiEnabled(enabled: Boolean) {
@@ -347,18 +386,17 @@ object ShizukuUtil {
 
         val addMethod = getWifiMethod(wifiService, "addOrUpdateNetwork")
 
-        val wifiConfigurationClass = Class.forName("android.net.wifi.WifiConfiguration")
-        val wifiConfig = wifiConfigurationClass.getDeclaredConstructor().newInstance()
-        wifiConfigurationClass.getField("SSID").set(wifiConfig, "\"$ssid\"")
+        val wifiConfig = newWifiConfiguration()
+        wifiConfigField("SSID").set(wifiConfig, "\"$ssid\"")
 
         val keyMgmtBitSet = BitSet()
         if (password.isEmpty()) {
             keyMgmtBitSet.set(0)
         } else {
-            wifiConfigurationClass.getField("preSharedKey").set(wifiConfig, "\"$password\"")
+            wifiConfigField("preSharedKey").set(wifiConfig, "\"$password\"")
             keyMgmtBitSet.set(1)
         }
-        wifiConfigurationClass.getField("allowedKeyManagement").set(wifiConfig, keyMgmtBitSet)
+        wifiConfigField("allowedKeyManagement").set(wifiConfig, keyMgmtBitSet)
 
         val netId = when (addMethod.parameterTypes.size) {
             3 -> addMethod.invoke(wifiService, wifiConfig, PACKAGE_NAME, Bundle())
@@ -480,11 +518,10 @@ object ShizukuUtil {
             return results
         }
 
-        val scanResultClass = Class.forName("android.net.wifi.ScanResult")
-        val ssidField = scanResultClass.getField("SSID")
-        val bssidField = scanResultClass.getField("BSSID")
-        val levelField = scanResultClass.getField("level")
-        val capabilitiesField = scanResultClass.getField("capabilities")
+        val ssidField = scanResultField("SSID")
+        val bssidField = scanResultField("BSSID")
+        val levelField = scanResultField("level")
+        val capabilitiesField = scanResultField("capabilities")
 
         scanResultsList.forEach { result ->
             val ssid = ssidField.get(result)?.toString() ?: ""
