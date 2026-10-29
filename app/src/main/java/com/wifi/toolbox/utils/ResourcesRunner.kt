@@ -5,6 +5,9 @@ import android.webkit.*
 import com.wifi.toolbox.R
 import com.wifi.toolbox.structs.WifiInfo
 import kotlinx.coroutines.*
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.coroutines.resume
 
 object ResourcesRunner {
@@ -29,6 +32,34 @@ object ResourcesRunner {
         }
     }
 
+    // region WebView 复用
+    /**
+     * 性能说明：构造 WebView 需要初始化 WebKit，首次往往要几百毫秒。
+     * 原先每生成一次密码本都新建一个 WebView 并在结束时 destroy，
+     * 这笔开销被反复支付。这里改为全局复用一个实例。
+     *
+     * 复用带来的风险是「上一次超时遗留的脚本」仍在跑并继续往结果里塞数据，
+     * 因此用 generation 做代际校验：每轮执行自增，过期回调直接丢弃；
+     * 同时用 Mutex 串行化，避免两个脚本共用同一个 WebView 互相污染。
+     */
+    private val scriptMutex = Mutex()
+
+    @Volatile
+    private var cachedWebView: WebView? = null
+    private val generation = AtomicInteger(0)
+
+    private fun obtainWebView(context: Context): WebView {
+        cachedWebView?.let { return it }
+        return synchronized(this) {
+            cachedWebView ?: WebView(context.applicationContext).apply {
+                settings.javaScriptEnabled = true
+                settings.domStorageEnabled = true
+                settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+            }.also { cachedWebView = it }
+        }
+    }
+    // endregion
+
     suspend fun runScript(
         context: Context,
         jsContent: String,
@@ -37,60 +68,62 @@ object ResourcesRunner {
         onLog: (String) -> Unit
     ): List<String> = withContext(Dispatchers.Main) {
         val resultList = mutableListOf<String>()
-        val webView = WebView(context)
-        webView.settings.javaScriptEnabled = true
-        webView.settings.domStorageEnabled = true
-        webView.settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
-        webView.webChromeClient = object : WebChromeClient() {
-            override fun onConsoleMessage(cm: ConsoleMessage?): Boolean {
-                cm?.message()?.let { onLog(it) }
-                return true
-            }
-        }
-
-        try {
-            withTimeout(timeout) {
-                suspendCancellableCoroutine { continuation ->
-                    val bridge = WebAppInterface(
-                        _ssid = wifiInfo.ssid,
-                        onAdd = { resultList.add(it) },
-                        onFinish = { if (continuation.isActive) continuation.resume(Unit) }
-                    )
-                    webView.addJavascriptInterface(bridge, "_bridge")
-
-                    val wrapperJs = """
-                        (async function() {
-                            window.task = {
-                                ssid: _bridge.getSsid(),
-                                addItem: function(i){ _bridge.addItem(i) },
-                                finish: function(){ _bridge.finish() },
-                                wait: function(ms){ return new Promise(r => setTimeout(r, ms)) }
-                            };
-                            try {
-                                const wait = t => new Promise(r => setTimeout(r, t))
-                                await (async () => {
-                                    $jsContent
-                                })();
-                            } catch(e) {
-                                console.log("${context.getString(R.string.script_error_prefix, "")}" + e.message);
-                            } finally {
-                                window.task.finish();
-                            }
-                        })();
-                    """.trimIndent()
-
-                    webView.evaluateJavascript(wrapperJs, null)
-
-                    continuation.invokeOnCancellation {
-                        webView.stopLoading()
-                        webView.destroy()
-                    }
+        scriptMutex.withLock {
+            val webView = obtainWebView(context)
+            val currentGen = generation.incrementAndGet()
+            webView.webChromeClient = object : WebChromeClient() {
+                override fun onConsoleMessage(cm: ConsoleMessage?): Boolean {
+                    cm?.message()?.let { if (generation.get() == currentGen) onLog(it) }
+                    return true
                 }
             }
-        } catch (e: Exception) {
-            onLog(context.getString(R.string.execution_exception, e.message))
-        } finally {
-            webView.destroy()
+
+            try {
+                withTimeout(timeout) {
+                    suspendCancellableCoroutine { continuation ->
+                        val bridge = WebAppInterface(
+                            _ssid = wifiInfo.ssid,
+                            onAdd = { if (generation.get() == currentGen) resultList.add(it) },
+                            onFinish = { if (continuation.isActive) continuation.resume(Unit) }
+                        )
+                        webView.addJavascriptInterface(bridge, "_bridge")
+
+                        val wrapperJs = """
+                            (async function() {
+                                window.task = {
+                                    ssid: _bridge.getSsid(),
+                                    addItem: function(i){ _bridge.addItem(i) },
+                                    finish: function(){ _bridge.finish() },
+                                    wait: function(ms){ return new Promise(r => setTimeout(r, ms)) }
+                                };
+                                try {
+                                    const wait = t => new Promise(r => setTimeout(r, t))
+                                    await (async () => {
+                                        $jsContent
+                                    })();
+                                } catch(e) {
+                                    console.log("${context.getString(R.string.script_error_prefix, "")}" + e.message);
+                                } finally {
+                                    window.task.finish();
+                                }
+                            })();
+                        """.trimIndent()
+
+                        webView.evaluateJavascript(wrapperJs, null)
+
+                        continuation.invokeOnCancellation {
+                            webView.stopLoading()
+                            // 作废本轮遗留脚本的输出，避免污染下一轮结果
+                            generation.incrementAndGet()
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                onLog(context.getString(R.string.execution_exception, e.message))
+            } finally {
+                // 不 destroy：WebView 交给缓存复用
+                generation.incrementAndGet()
+            }
         }
         resultList
     }

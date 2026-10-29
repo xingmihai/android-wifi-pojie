@@ -12,6 +12,7 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.*
 import androidx.compose.ui.window.PopupPositionProvider
 import com.wifi.toolbox.R
+import com.wifi.toolbox.ToolboxApp
 import com.wifi.toolbox.structs.PojieConfig
 import kotlinx.coroutines.launch
 
@@ -303,4 +304,96 @@ fun ConfigView(
             )
         }
     }
+
+    DeviceTuningSection()
+}
+
+@Composable
+private fun DeviceTuningSection() {
+    val app = ToolboxApp.instance
+    val tuning = app.tuning.current
+
+    Spacer(modifier = Modifier.height(8.dp))
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(
+            stringResource(R.string.tuning_title),
+            modifier = Modifier.padding(0.dp, 8.dp),
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.primary
+        )
+    }
+    Text(
+        text = stringResource(R.string.tuning_profile, tuning.profileId),
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant
+    )
+
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(stringResource(R.string.tuning_early_reject))
+        Switch(
+            checked = tuning.earlyRejectEnabled,
+            onCheckedChange = { enabled ->
+                app.tuning.update { it.copy(earlyRejectEnabled = enabled) }
+            }
+        )
+    }
+    AnimatedVisibility(
+        visible = tuning.earlyRejectEnabled,
+        enter = expandVertically(),
+        exit = shrinkVertically()
+    ) {
+        Column {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(stringResource(R.string.tuning_early_reject_window))
+                Text(
+                    text = stringResource(R.string.ms_string, tuning.earlyRejectWindowMs),
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(horizontal = 8.dp)
+                )
+            }
+            Slider(
+                value = tuning.earlyRejectWindowMs.toFloat(),
+                onValueChange = { v ->
+                    app.tuning.update { it.copy(earlyRejectWindowMs = v.toInt()) }
+                },
+                valueRange = 100f..3000f,
+                steps = 28
+            )
+            Text(
+                text = stringResource(R.string.tuning_early_reject_hint),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+    }
+
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(stringResource(R.string.tuning_skip_disconnect))
+        Switch(
+            checked = tuning.skipDisconnectBetweenTries,
+            onCheckedChange = { enabled ->
+                app.tuning.update { it.copy(skipDisconnectBetweenTries = enabled) }
+            }
+        )
+    }
+    Text(
+        text = stringResource(R.string.tuning_skip_disconnect_hint),
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant
+    )
 }

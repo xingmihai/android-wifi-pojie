@@ -14,7 +14,8 @@ class LogState {
     var lastAllowEditIndex by mutableIntStateOf(-1)
 
     fun addLog(log: String, allowEdit: Boolean = false) {
-        Log.d("Log", "addLog:$log")
+        // 破解过程中日志高频写入，release 包不再回写 logd
+        if (com.wifi.toolbox.BuildConfig.DEBUG) Log.d("Log", "addLog:$log")
         if (allowEdit) lastAllowEditIndex = logs.size
         if (logs.size >= 300) {
             logs.removeAt(0)
@@ -29,7 +30,7 @@ class LogState {
     }
 
     fun setLine(log: String) {
-        Log.d("Log", "setLine:$log")
+        if (com.wifi.toolbox.BuildConfig.DEBUG) Log.d("Log", "setLine:$log")
         if (lastAllowEditIndex != -1) {
             logs[lastAllowEditIndex] = log
         } else {

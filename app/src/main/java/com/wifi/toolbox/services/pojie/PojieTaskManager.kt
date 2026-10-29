@@ -11,6 +11,7 @@ import com.wifi.toolbox.utils.ShizukuUtil
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.scan
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.pow
 
 /**
@@ -30,6 +31,32 @@ class PojieTaskManager(
     private var currentWorkingSsid: String? = null
     private val handledSsids = mutableSetOf<String>()
 
+    /** 已写入过全量历史（含密码表）的 ssid，之后只更新进度 */
+    private val historyEnsured = mutableSetOf<String>()
+    private val lastHistoryWriteAt = mutableMapOf<String, Long>()
+
+    /**
+     * 弹窗压制：需要杀一次「设置」时为 true，由保镖循环消费。
+     * 原实现每 250ms 无条件执行一次 am force-stop（每次都要 fork 进程并同步等待返回），
+     * 相当于每秒 4 次进程创建常驻在 Default 线程池上，和真正的连接任务抢线程。
+     */
+    private val pendingDialogSuppression = AtomicBoolean(false)
+
+    @Volatile
+    private var lastSuppressionKillTime = 0L
+
+    companion object {
+        private const val SUPPRESS_POLL_INTERVAL = 300L
+        private const val SUPPRESS_MIN_INTERVAL = 2000L
+
+        /**
+         * 进度写库的最小间隔。
+         * Room 每次写 history_metadata 都会让 historyFlow 重跑一次「全表 + 密码表 JOIN」，
+         * 破解时进度每秒变好几次，不做节流就等于每尝试一个密码都重查几千行。
+         */
+        private const val HISTORY_WRITE_MIN_INTERVAL = 3000L
+    }
+
     fun isWorking(): Boolean = mainLoopJob != null && mainLoopJob!!.isActive
 
     fun cancelCurrentJob() {
@@ -42,19 +69,17 @@ class PojieTaskManager(
         val app = service.applicationContext as ToolboxApp
         val safeScope = scope + SupervisorJob()
 
-        settingsMonitorJob = safeScope.launch {
+        settingsMonitorJob = safeScope.launch(Dispatchers.IO) {
             try {
                 while (isActive) {
-                    if (settings.connectMode != 4) {
-                        if (AidlServiceHelper.executeCommandSync(
-                                app,
-                                "am force-stop com.android.settings"
-                            ).exitCode != 0
-                        ) {
-                            ShizukuUtil.executeCommandSync("am force-stop com.android.settings")
+                    if (settings.connectMode != 4 && pendingDialogSuppression.getAndSet(false)) {
+                        val now = System.currentTimeMillis()
+                        if (now - lastSuppressionKillTime >= SUPPRESS_MIN_INTERVAL) {
+                            lastSuppressionKillTime = now
+                            suppressDialogs(app)
                         }
                     }
-                    delay(250)
+                    delay(SUPPRESS_POLL_INTERVAL)
                 }
             } finally {
             }
@@ -112,6 +137,21 @@ class PojieTaskManager(
         }
     }
 
+    /**
+     * 压制密码错误弹窗。包名来自机型特调配置，
+     * force-stop 一个不存在的包只会失败，不会报错。
+     */
+    private fun suppressDialogs(app: ToolboxApp) {
+        for (pkg in app.tuning.current.forceStopPackages) {
+            val cmd = "am force-stop $pkg"
+            runCatching {
+                if (AidlServiceHelper.executeCommandSync(app, cmd).exitCode != 0) {
+                    ShizukuUtil.executeCommandSync(cmd)
+                }
+            }
+        }
+    }
+
     private suspend fun handleCooldown(app: ToolboxApp): Boolean {
         val now = System.currentTimeMillis()
         val tasks = app.runningPojieTasks
@@ -163,11 +203,17 @@ class PojieTaskManager(
         task: PojieRunInfo,
         settings: PojieSettings
     ) {
+        // 仅在提示文案真正变化时才写状态：每次写入都会触发 snapshot 变更 -> snapshotFlow -> 任务列表重组
         app.runningPojieTasks.forEach {
-            app.pojieTask.edit(it.ssid) { state ->
-                state.copy(textTip = service.getString(if (it.ssid == task.ssid) R.string.task_attempting else R.string.task_queuing))
+            val newTip = service.getString(if (it.ssid == task.ssid) R.string.task_attempting else R.string.task_queuing)
+            if (it.textTip != newTip) {
+                app.pojieTask.edit(it.ssid) { state ->
+                    state.copy(textTip = newTip)
+                }
             }
         }
+
+        pendingDialogSuppression.set(true)
 
         currentWorkingSsid = task.ssid
         val currentPass =
@@ -304,6 +350,9 @@ class PojieTaskManager(
 
         if (result == SinglePojieTask.RESULT_CANCEL) return
 
+        // 密码错误后部分 ROM（如小米）会弹出提示窗，事后补杀一次
+        if (result != SinglePojieTask.RESULT_SUCCESS) pendingDialogSuppression.set(true)
+
         when (result) {
             SinglePojieTask.RESULT_SUCCESS -> {
                 service.log("${service.getString(R.string.result_success)}: (${task.ssid}, $pass)")
@@ -316,6 +365,8 @@ class PojieTaskManager(
                     )
                 )
                 handledSsids.add(task.ssid)
+                // 任务已结束，下次若用新字典需重新写入全量
+                historyEnsured.remove(task.ssid)
                 app.pojieTask.stop(task.ssid)
             }
 
@@ -355,7 +406,9 @@ class PojieTaskManager(
             else -> app.pojieTask.stop(task.ssid)
         }
 
-        scope.launch(Dispatchers.IO) { updateHistory(app, task.ssid) }
+        buildHistoryWrite(app, task.ssid)?.let { write ->
+            scope.launch(Dispatchers.IO) { write() }
+        }
     }
 
     private fun processTaskCompletion(app: ToolboxApp, ssid: String) {
@@ -365,6 +418,11 @@ class PojieTaskManager(
         if (nextIndex >= task.tryList.size) {
             app.finishedPojieTasksTip[ssid] =
                 service.getString(R.string.tip_all_failed, task.tryList.size)
+            historyEnsured.remove(ssid)
+            // 收尾时补一次全量写，避免被节流跳过的最后一次进度丢失
+            app.pojieHistory.addOrUpdateHistory(
+                PojieHistoryItem(task.ssid, task.tryList, nextIndex)
+            )
             app.pojieTask.stop(ssid)
         }
     }
@@ -372,15 +430,23 @@ class PojieTaskManager(
     private fun getTask(app: ToolboxApp, ssid: String): PojieRunInfo? =
         app.runningPojieTasks.find { it.ssid == ssid }
 
-    private fun updateHistory(app: ToolboxApp, ssid: String) {
-        getTask(app, ssid)?.let { task ->
-            app.pojieHistory.addOrUpdateHistory(
-                PojieHistoryItem(
-                    task.ssid,
-                    task.tryList,
-                    task.tryIndex
-                )
-            )
+    /**
+     * 构造一次历史写入动作；无需写入时返回 null。
+     *
+     * 全部共享状态只在这里（调度协程内）访问，DB 调用再丢到 IO 线程执行，避免加锁。
+     */
+    private fun buildHistoryWrite(app: ToolboxApp, ssid: String): (() -> Unit)? {
+        val task = getTask(app, ssid) ?: return null
+        if (historyEnsured.add(task.ssid)) {
+            // 首次：连整份密码表一起写入，之后只更新进度
+            val item = PojieHistoryItem(task.ssid, task.tryList, task.tryIndex)
+            lastHistoryWriteAt[task.ssid] = System.currentTimeMillis()
+            return { app.pojieHistory.addOrUpdateHistory(item) }
         }
+        val now = System.currentTimeMillis()
+        if (now - (lastHistoryWriteAt[task.ssid] ?: 0L) < HISTORY_WRITE_MIN_INTERVAL) return null
+        lastHistoryWriteAt[task.ssid] = now
+        val progress = task.tryIndex
+        return { app.pojieHistory.updateProgressOnly(task.ssid, progress) }
     }
 }

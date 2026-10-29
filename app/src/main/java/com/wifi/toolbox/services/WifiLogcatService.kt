@@ -4,6 +4,7 @@ import android.util.Log
 import android.content.Context
 import com.wifi.toolbox.R
 import com.wifi.toolbox.ToolboxApp
+import com.wifi.toolbox.structs.DeviceTuning
 import com.wifi.toolbox.structs.PojieSettings
 import com.wifi.toolbox.structs.WifiLogData
 import com.wifi.toolbox.utils.AidlServiceHelper
@@ -14,7 +15,9 @@ import kotlinx.coroutines.flow.asSharedFlow
 import java.util.function.Consumer
 
 class WifiLogcatService(
-    private val context: Context, private val pojieSettings: PojieSettings
+    private val context: Context,
+    private val pojieSettings: PojieSettings,
+    private val tuning: DeviceTuning
 ) : AutoCloseable {
     var stopFunc: Runnable? = null
 
@@ -81,9 +84,14 @@ class WifiLogcatService(
     init {
         executeCommandSync("logcat -c")
         stopFunc = executeCommand(
-            command = "logcat -s WifiService:D wpa_supplicant:D DhcpClient:D",
-            onOutputReceived = { line ->
-                Log.d("WifiLogcatService", line)
+            command = "logcat -s ${tuning.logcatTags}",
+            onOutputReceived = onOutputReceived@ { line ->
+                // 性能说明两点：
+                // 1) 原先每一行日志都要 Log.d 回写 logd，破解时 wpa_supplicant 每秒能吐出上百行，
+                //    这些回写纯属debug残留，改为仅在 debug 包保留；
+                // 2) 先做一次廉价粗筛，绝大多数行与结果判定无关，避免每行都跑满 6 次 contains。
+                if (com.wifi.toolbox.BuildConfig.DEBUG) Log.d("WifiLogcatService", line)
+                if (!isInterestingLine(line)) return@onOutputReceived
                 when {
                     line.contains("Trying to associate with SSID") -> {
                         val match = Regex("SSID '(.*?)'").find(line)
@@ -150,6 +158,18 @@ class WifiLogcatService(
             onCommandFinished = {
                 //注：这里正常不应被执行
             })
+    }
+
+    /**
+     * 粗筛：只放行可能命中判定的日志行。
+     * 命中关键词与下方 when 分支一一对应，新增分支时记得同步这里。
+     */
+    private fun isInterestingLine(line: String): Boolean {
+        return line.contains("WPA:")
+                || line.contains("WifiService")
+                || line.contains("Trying to associate")
+                || line.contains("EAPOL-Key")
+                || line.contains("CTRL-EVENT-ASSOC-REJECT")
     }
 
 }

@@ -57,7 +57,9 @@ class PojieService : Service() {
                 app.logState.clear()
                 log(getAsciiArt())
 
-                connectionWorker.initLogServices(pojieSettings)
+                val tuning = (applicationContext as ToolboxApp).tuning.current
+            log(getString(R.string.tuning_profile, tuning.profileId))
+            connectionWorker.initLogServices(pojieSettings, tuning)
                 taskDispatcher.startLoop(pojieSettings)
             }
             return START_STICKY

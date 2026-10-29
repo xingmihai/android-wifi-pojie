@@ -9,6 +9,7 @@ import com.wifi.toolbox.services.*
 import com.wifi.toolbox.structs.*
 import com.wifi.toolbox.utils.*
 import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.flow.first
 import java.util.Locale
 import kotlin.coroutines.resumeWithException
@@ -21,6 +22,7 @@ class ConnectWorker(
     private val service: PojieService
 ) {
     private var readLogMode = 0
+    private var tuning: DeviceTuning = DeviceTuning.GENERIC
     private var logcatService: WifiLogcatService? = null
     private var broadcastService: WifiBroadcastService? = null
     private var connectWifiApi29Callback: ConnectivityManager.NetworkCallback? = null
@@ -28,12 +30,13 @@ class ConnectWorker(
     /**
      * 初始化日志收集服务
      */
-    fun initLogServices(settings: PojieSettings) {
+    fun initLogServices(settings: PojieSettings, tuning: DeviceTuning) {
+        this.tuning = tuning
         readLogMode = settings.readLogMode
         when (readLogMode) {
             0 -> throw Exception(service.getString(R.string.log_mode_empty))
             1 -> {
-                logcatService = WifiLogcatService(service, settings)
+                logcatService = WifiLogcatService(service, settings, tuning)
                 service.log(service.getString(R.string.log_logcat_started))
             }
 
@@ -135,7 +138,7 @@ class ConnectWorker(
                         }
                     } else throw Exception(service.getString(R.string.device_too_old))
                 } else {
-                    val flow = when (readLogMode) {
+                    val source = when (readLogMode) {
                         1 -> logcatService?.logFlow
                         2 -> {
                             if (app.pojieConfig.failureFlag == 2) {
@@ -148,14 +151,44 @@ class ConnectWorker(
                         else -> null
                     }
 
-                    if (flow == null) throw Exception(service.getString(R.string.log_flow_uninitialized))
+                    if (source == null) throw Exception(service.getString(R.string.log_flow_uninitialized))
 
-                    var finalResult = -1
-                    flow.first { data ->
-                        finalResult = checkLogDataSync(data, app, task, startTime, connectMode)
-                        finalResult != -1
+                    // 提前判负：合成一个「握手无进展」事件流，与主事件流合并。
+                    // 首次握手后开一个观察窗，窗内没等到完成就判定密码错误，
+                    // 省掉 wpa_supplicant 的整个重试周期。
+                    val timerScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+                    try {
+                        val staleFlow = MutableSharedFlow<WifiLogData>(extraBufferCapacity = 8)
+                        val flow = merge(source, staleFlow)
+
+                        var armed = false
+                        var finalResult = -1
+                        flow.first { data ->
+                            if (tuning.earlyRejectEnabled && !armed
+                                && data.event == WifiLogData.EVENT_HANDSHAKE
+                                && data.handshakeCount == 1
+                                && isMatch(data, task, startTime, connectMode)
+                            ) {
+                                armed = true
+                                timerScope.launch {
+                                    delay(tuning.earlyRejectWindowMs.toLong())
+                                    staleFlow.tryEmit(
+                                        WifiLogData(
+                                            WifiLogData.EVENT_HANDSHAKE_STALE,
+                                            data.eventStartTime,
+                                            data.ssid,
+                                            handshakeCount = data.handshakeCount
+                                        )
+                                    )
+                                }
+                            }
+                            finalResult = checkLogDataSync(data, app, task, startTime, connectMode)
+                            finalResult != -1
+                        }
+                        finalResult
+                    } finally {
+                        timerScope.cancel()
                     }
-                    finalResult
                 }
             }
         } catch (_: TimeoutCancellationException) {
@@ -167,6 +200,14 @@ class ConnectWorker(
         }
     }
 
+    private fun isMatch(
+        data: WifiLogData,
+        task: SinglePojieTask,
+        startTime: Long,
+        connectMode: Int
+    ): Boolean =
+        connectMode == 4 || (data.ssid == task.ssid && data.eventStartTime >= startTime)
+
     private fun checkLogDataSync(
         data: WifiLogData,
         app: ToolboxApp,
@@ -174,9 +215,7 @@ class ConnectWorker(
         startTime: Long,
         connectMode: Int
     ): Int {
-        val isMatch =
-            connectMode == 4 || (data.ssid == task.ssid && data.eventStartTime >= startTime)
-        if (!isMatch) return -1
+        if (!isMatch(data, task, startTime, connectMode)) return -1
 
         return when (data.event) {
             WifiLogData.EVENT_WIFI_CONNECTED -> if (connectMode != 4) SinglePojieTask.RESULT_SUCCESS else -1
@@ -191,6 +230,9 @@ class ConnectWorker(
                     )
                 ) SinglePojieTask.RESULT_FAILED else -1
             }
+
+            // 观察窗内握手无进展 -> 视为密码错误，立刻换下一个
+            WifiLogData.EVENT_HANDSHAKE_STALE -> SinglePojieTask.RESULT_FAILED
 
             WifiLogData.EVENT_CONNECT_ERROR -> SinglePojieTask.RESULT_ERROR_TRANSIENT
             else -> -1
@@ -223,7 +265,8 @@ class ConnectWorker(
         if (connectWifiApi29Callback != null) {
             ApiUtil.cancelWifiRequest(service, connectWifiApi29Callback!!)
             connectWifiApi29Callback = null
-        } else {
+        } else if (!tuning.skipDisconnectBetweenTries) {
+            // skipDisconnectBetweenTries：省掉每次尝试后的断开，少一次 supplicant IPC
             when (settings.enableMode) {
                 1 -> ShizukuUtil.disconnectWifi()
                 2 -> ApiUtil.disconnectWifi(service)

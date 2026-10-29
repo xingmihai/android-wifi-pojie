@@ -384,4 +384,11 @@
     <string name="unsupported_file_format">不支持的文件格式</string>
     <string name="import_failed">导入失败</string>
     <string name="parse_failed">解析失败</string>
+    <string name="tuning_title">机型特调</string>
+    <string name="tuning_profile">当前配置：%1$s</string>
+    <string name="tuning_early_reject">提前判负</string>
+    <string name="tuning_early_reject_window">判负观察窗</string>
+    <string name="tuning_early_reject_hint">首次握手后，若窗口内未完成密钥协商即判为密码错误，省掉一次重试等待。窗口过小可能误判正确密码，弱信号建议调大。</string>
+    <string name="tuning_skip_disconnect">尝试间不断开</string>
+    <string name="tuning_skip_disconnect_hint">省去每次尝试后的断开操作，速度更快，但可能残留上一次的连接状态。</string>
 </resources>

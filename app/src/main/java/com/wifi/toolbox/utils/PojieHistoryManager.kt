@@ -99,6 +99,11 @@ class PojieHistoryManager(context: Context) {
     private val dao = AppDatabase.getInstance(context).pojieDao()
     private val scope = CoroutineScope(Dispatchers.IO)
 
+    /**
+     * 说明：不再使用 SharingStarted.Eagerly。
+     * 破解过程中进度会高频变更，Room 每次变更都会重跑一次「全表 + 密码表 JOIN」并重建几千个字符串对象，
+     * 即使没有任何界面在观察也会持续空转。改为无订阅者 5 秒后停止收集。
+     */
     val historyFlow: StateFlow<List<PojieHistoryItem>> = dao.getAllHistoryFlow()
         .map { list ->
             list.map {
@@ -111,12 +116,31 @@ class PojieHistoryManager(context: Context) {
                 )
             }
         }
-        .stateIn(scope, SharingStarted.Eagerly, emptyList())
+        .distinctUntilChanged()
+        .stateIn(scope, SharingStarted.WhileSubscribed(5000), emptyList())
 
+    /**
+     * 全量写入（含整个密码列表）。
+     * 只在「任务开始」和「破解成功」时调用 —— 这两个时刻各任务生命周期内最多各一次。
+     */
     fun addOrUpdateHistory(item: PojieHistoryItem) {
         scope.launch {
             val itemWithTime = item.copy(lasttime = System.currentTimeMillis())
             dao.fullUpsert(itemWithTime)
+        }
+    }
+
+    /**
+     * 仅更新进度：单条 UPDATE，不触碰 password_items 表。
+     *
+     * 性能说明：原实现每尝试一个密码都走 fullUpsert（DELETE 全部密码行 + 重新 INSERT 全部密码行）。
+     * 一个 2493 条的字典意味着每尝试一个密码就要做约 5000 行的写事务，
+     * 这会占满 IO 线程池、拖慢真正的连接尝试，并且让 historyFlow 反复重算。
+     * 进度变化只需要改 history_metadata 一行即可。
+     */
+    fun updateProgressOnly(ssid: String, progress: Int) {
+        scope.launch {
+            dao.updateProgress(ssid, progress, System.currentTimeMillis())
         }
     }
 

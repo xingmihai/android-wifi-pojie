@@ -12,6 +12,7 @@ import com.wifi.toolbox.app.AppUI
 import com.wifi.toolbox.utils.ActivityStack
 import com.wifi.toolbox.utils.PojieHistoryManager
 import com.wifi.toolbox.utils.SettingsManager
+import com.wifi.toolbox.utils.TuningManager
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -40,6 +41,7 @@ class ToolboxApp : Application() {
     lateinit var pojieTask: AppPojieTask
     lateinit var aidl: AppAidl
     lateinit var settings: SettingsManager
+    lateinit var tuning: TuningManager
     lateinit var pojieHistory: PojieHistoryManager
 
     val pojieConfig get() = pojieTask.pojieConfig
@@ -59,6 +61,7 @@ class ToolboxApp : Application() {
         aidl = AppAidl(this)
         pojieTask = AppPojieTask(this)
         settings = SettingsManager(this)
+        tuning = TuningManager(this)
         pojieHistory = PojieHistoryManager(this)
 
         appCrash.startCatch()
